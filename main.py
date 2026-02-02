@@ -2,21 +2,24 @@
 """
 WordPress Block Agent - A LangChain-powered agent for generating ACF blocks.
 
-Uses the supervisor pattern with create_agent to orchestrate sub-agents.
+Uses the supervisor pattern with create_agent and HITL for field approval.
 """
 
 import os
 import re
 import sys
+import json
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.tools import tool, ToolRuntime
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from agents import PHPTemplateAgent, ACFJsonAgent
 
@@ -28,6 +31,8 @@ class BlockState(AgentState):
     """State for the block generation workflow."""
     block_description: str
     block_name: str
+    proposed_fields: list
+    approved_fields: list
     php_template: str
     acf_json: dict
     output_dir: str
@@ -49,7 +54,8 @@ def print_status(message: str, status: str = "info"):
         "working": "⏳",
         "success": "✅",
         "error": "❌",
-        "output": "📄"
+        "output": "📄",
+        "review": "👀"
     }
     icon = icons.get(status, "")
     print(f"\n{icon} {message}")
@@ -63,8 +69,77 @@ def save_output(content: str, filename: str, output_dir: Path) -> Path:
     return filepath
 
 
+def display_proposed_fields(fields: list) -> None:
+    """Display proposed fields for user review."""
+    print("\n" + "=" * 50)
+    print("📋 PROPOSED FIELDS FOR REVIEW")
+    print("=" * 50)
+
+    for i, field in enumerate(fields, 1):
+        field_type = field.get("type", "text")
+        field_name = field.get("name", "unnamed")
+        field_label = field.get("label", field_name)
+        required = "required" if field.get("required") else "optional"
+        print(f"\n  {i}. {field_label}")
+        print(f"     Name: {field_name}")
+        print(f"     Type: {field_type} ({required})")
+        if field.get("description"):
+            print(f"     Description: {field.get('description')}")
+
+    print("\n" + "-" * 50)
+
+
+def get_user_field_decision(fields: list) -> dict:
+    """Get user decision on proposed fields."""
+    display_proposed_fields(fields)
+
+    print("\nOptions:")
+    print("  [a] Approve these fields and continue")
+    print("  [e] Edit fields (provide modifications)")
+    print("  [r] Reject and provide feedback")
+    print()
+
+    while True:
+        choice = input("Your choice (a/e/r): ").strip().lower()
+
+        if choice == 'a':
+            return {"type": "approve"}
+
+        elif choice == 'e':
+            print("\nProvide your edited fields as JSON.")
+            print("Example: [{\"name\": \"title\", \"type\": \"text\", \"label\": \"Title\", \"required\": true}]")
+            print("Or type 'cancel' to go back.\n")
+
+            edited_input = input("Edited fields JSON: ").strip()
+            if edited_input.lower() == 'cancel':
+                continue
+
+            try:
+                edited_fields = json.loads(edited_input)
+                return {
+                    "type": "edit",
+                    "edited_action": {
+                        "name": "propose_fields",
+                        "args": {"fields": json.dumps(edited_fields)}
+                    }
+                }
+            except json.JSONDecodeError as e:
+                print(f"Invalid JSON: {e}. Try again.")
+                continue
+
+        elif choice == 'r':
+            feedback = input("\nYour feedback for the agent: ").strip()
+            if not feedback:
+                print("Please provide feedback.")
+                continue
+            return {"type": "reject", "message": feedback}
+
+        else:
+            print("Invalid choice. Please enter 'a', 'e', or 'r'.")
+
+
 def create_orchestrator():
-    """Create the main orchestrator agent with sub-agent tools."""
+    """Create the main orchestrator agent with sub-agent tools and HITL."""
 
     model = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.3)
     output_base = Path(__file__).parent / "output"
@@ -83,7 +158,6 @@ def create_orchestrator():
         block_name = sanitize_block_name(block_description)
         output_dir = str(output_base / block_name)
 
-        from langgraph.types import Command
         return Command(update={
             "block_description": block_description,
             "block_name": block_name,
@@ -91,23 +165,46 @@ def create_orchestrator():
         })
 
     @tool
+    def propose_fields(fields: str, runtime: ToolRuntime) -> str:
+        """Propose the ACF fields needed for this block. This will be reviewed by the user.
+
+        Args:
+            fields: JSON string array of field objects with name, type, label, required, and description
+        """
+        try:
+            parsed_fields = json.loads(fields)
+        except json.JSONDecodeError:
+            return "Error: Invalid JSON for fields"
+
+        print_status("Fields proposed for review...", "review")
+
+        return Command(update={
+            "proposed_fields": parsed_fields,
+            "approved_fields": parsed_fields,  # Will be updated if user edits
+        })
+
+    @tool
     def generate_php_template(runtime: ToolRuntime) -> str:
-        """Generate a PHP template for the ACF block using the PHP template sub-agent."""
+        """Generate a PHP template for the ACF block using the approved fields."""
         description = runtime.state.get("block_description", "")
         block_name = runtime.state.get("block_name", "")
+        approved_fields = runtime.state.get("approved_fields", [])
         output_dir = Path(runtime.state.get("output_dir", "output"))
 
-        print_status("Generating PHP template...", "working")
+        # Enhance description with approved fields
+        fields_desc = "\n".join([
+            f"- {f.get('name')} ({f.get('type', 'text')}): {f.get('label', f.get('name'))}"
+            for f in approved_fields
+        ])
+        enhanced_description = f"{description}\n\nApproved fields:\n{fields_desc}"
+
+        print_status("Generating PHP template with approved fields...", "working")
 
         try:
-            template = php_agent.create_template(description)
-
-            # Save the template
+            template = php_agent.create_template(enhanced_description)
             php_path = save_output(template, f"{block_name}.php", output_dir)
             print_status(f"PHP template saved to: {php_path}", "success")
 
-            # Update state with template
-            from langgraph.types import Command
             return Command(update={
                 "php_template": template,
             })
@@ -118,20 +215,28 @@ def create_orchestrator():
 
     @tool
     def generate_acf_json(runtime: ToolRuntime) -> str:
-        """Generate ACF JSON field configuration using the ACF JSON sub-agent."""
+        """Generate ACF JSON field configuration using the approved fields."""
         description = runtime.state.get("block_description", "")
         block_name = runtime.state.get("block_name", "")
         php_template = runtime.state.get("php_template", "")
+        approved_fields = runtime.state.get("approved_fields", [])
         output_dir = Path(runtime.state.get("output_dir", "output"))
 
         if not php_template:
-            return "Error: PHP template must be generated first. Call generate_php_template first."
+            return "Error: PHP template must be generated first."
 
-        print_status("Generating ACF field group JSON...", "working")
+        # Enhance description with approved fields
+        fields_desc = "\n".join([
+            f"- {f.get('name')} ({f.get('type', 'text')}): {f.get('label', f.get('name'))}"
+            for f in approved_fields
+        ])
+        enhanced_description = f"{description}\n\nApproved fields (use these exact fields):\n{fields_desc}"
+
+        print_status("Generating ACF JSON with approved fields...", "working")
 
         try:
             acf_json = acf_agent.create_field_group(
-                block_description=description,
+                block_description=enhanced_description,
                 block_name=f"acf/{block_name}",
                 php_template=php_template
             )
@@ -145,13 +250,11 @@ def create_orchestrator():
                 )
                 return f"Partial success. Raw output saved to: {raw_path}"
 
-            # Save the JSON
             acf_formatted = acf_agent.format_json(acf_json)
             group_key = acf_json.get("key", f"group_{block_name}")
             acf_path = save_output(acf_formatted, f"{group_key}.json", output_dir)
             print_status(f"ACF JSON saved to: {acf_path}", "success")
 
-            from langgraph.types import Command
             return Command(update={
                 "acf_json": acf_json,
             })
@@ -167,33 +270,63 @@ def create_orchestrator():
         output_dir = runtime.state.get("output_dir", "output")
         php_template = runtime.state.get("php_template")
         acf_json = runtime.state.get("acf_json")
+        approved_fields = runtime.state.get("approved_fields", [])
 
         results = [f"Block '{block_name}' generated successfully!"]
         results.append(f"Output directory: {output_dir}")
 
+        if approved_fields:
+            results.append(f"\nFields included ({len(approved_fields)}):")
+            for f in approved_fields:
+                results.append(f"  - {f.get('name')} ({f.get('type', 'text')})")
+
+        results.append("\nGenerated files:")
         if php_template:
-            results.append(f"- PHP template: {block_name}.php")
+            results.append(f"  - PHP template: {block_name}.php")
         if acf_json and "error" not in acf_json:
             group_key = acf_json.get("key", f"group_{block_name}")
-            results.append(f"- ACF JSON: {group_key}.json")
+            results.append(f"  - ACF JSON: {group_key}.json")
 
         return "\n".join(results)
 
+    # Create agent with HITL middleware
     orchestrator = create_agent(
         model=model,
-        tools=[update_block_info, generate_php_template, generate_acf_json, summarize_results],
+        tools=[update_block_info, propose_fields, generate_php_template, generate_acf_json, summarize_results],
         state_schema=BlockState,
         checkpointer=InMemorySaver(),
+        middleware=[
+            HumanInTheLoopMiddleware(
+                interrupt_on={
+                    "update_block_info": False,
+                    "propose_fields": True,  # Interrupt for field approval
+                    "generate_php_template": False,
+                    "generate_acf_json": False,
+                    "summarize_results": False,
+                },
+                description_prefix="Field proposal requires your approval",
+            ),
+        ],
         system_prompt="""You are a WordPress block development assistant that orchestrates the creation of ACF blocks.
 
-When a user describes a block they want:
-1. First call update_block_info to initialize the block details
-2. Then call generate_php_template to create the PHP template
-3. Then call generate_acf_json to create the ACF field configuration
-4. Finally call summarize_results to tell the user what was created
+When a user describes a block they want, follow these steps IN ORDER:
 
-Always execute these steps in order. The PHP template must be generated before the ACF JSON.
-Be helpful and explain what you're doing at each step."""
+1. Call update_block_info to initialize the block details
+2. Call propose_fields with a JSON array of fields you think the block needs. Each field should have:
+   - name: snake_case field name
+   - type: ACF field type (text, textarea, image, wysiwyg, repeater, link, select, true_false, etc.)
+   - label: Human readable label
+   - required: boolean
+   - description: Brief description of what this field is for
+
+   Think carefully about what fields would be useful for the described block.
+
+3. After field approval, call generate_php_template
+4. Then call generate_acf_json
+5. Finally call summarize_results
+
+The user will review and approve the proposed fields before you proceed with generation.
+Be helpful and explain your reasoning for the fields you propose."""
     )
 
     return orchestrator
@@ -205,14 +338,15 @@ def print_welcome():
     print("🧱 WordPress Block Agent")
     print("=" * 60)
     print("\nI'll help you create WordPress ACF blocks!")
-    print("\nDescribe the block you want to create, and I'll generate:")
-    print("  • A PHP template file with ACF field integration")
-    print("  • An ACF JSON field group configuration")
+    print("\nDescribe the block you want to create, and I'll:")
+    print("  1. Propose fields for your review")
+    print("  2. Generate a PHP template with approved fields")
+    print("  3. Create an ACF JSON field configuration")
     print("\nType 'exit' to quit.\n")
 
 
 def main():
-    """Main chat loop."""
+    """Main chat loop with HITL support."""
     if not os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY") == "your_api_key_here":
         print("\n❌ Error: Please set your ANTHROPIC_API_KEY in the .env file")
         print("   Get your API key from: https://console.anthropic.com/")
@@ -247,21 +381,55 @@ def main():
             break
 
         thread_id += 1
+        config = {"configurable": {"thread_id": str(thread_id)}}
+
         print(f"\n🚀 Creating block based on: \"{user_input}\"")
 
         try:
             response = orchestrator.invoke(
                 {"messages": [HumanMessage(content=user_input)]},
-                {"configurable": {"thread_id": str(thread_id)}}
+                config=config
             )
 
+            # Check for HITL interrupt (field approval)
+            while response.get('__interrupt__'):
+                interrupt = response['__interrupt__'][0]
+                action_request = interrupt.value.get('action_requests', [{}])[0]
+                tool_name = action_request.get('name', '')
+
+                if tool_name == 'propose_fields':
+                    # Extract proposed fields from the tool args
+                    fields_json = action_request.get('args', {}).get('fields', '[]')
+                    try:
+                        fields = json.loads(fields_json)
+                    except json.JSONDecodeError:
+                        fields = []
+
+                    # Get user decision
+                    decision = get_user_field_decision(fields)
+
+                    # Resume with the decision
+                    response = orchestrator.invoke(
+                        Command(resume={"decisions": [decision]}),
+                        config=config
+                    )
+                else:
+                    # Unknown interrupt, approve by default
+                    response = orchestrator.invoke(
+                        Command(resume={"decisions": [{"type": "approve"}]}),
+                        config=config
+                    )
+
             # Print final response
-            final_message = response["messages"][-1].content
-            print("\n" + "=" * 40)
-            print(final_message)
+            if response.get("messages"):
+                final_message = response["messages"][-1].content
+                print("\n" + "=" * 40)
+                print(final_message)
 
         except Exception as e:
             print_status(f"Error during generation: {e}", "error")
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
