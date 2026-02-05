@@ -7,6 +7,7 @@ from pathlib import Path
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage
 
 
 def load_acf_reference() -> str:
@@ -78,7 +79,7 @@ class ACFJsonAgent:
 
     def create_field_group(self, block_description: str, block_name: str, php_template: str) -> dict:
         """Generate an ACF field group JSON based on the block and template."""
-        from langchain_core.messages import HumanMessage
+
 
         self.generated_json = None
 

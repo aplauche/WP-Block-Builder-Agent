@@ -1,8 +1,19 @@
 """PHP Template Agent - Creates WordPress ACF block templates using create_agent pattern."""
 
+from pathlib import Path
+
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain.tools import tool
+from langchain_core.messages import HumanMessage
+
+
+def load_innerblocks_reference() -> str:
+    """Load the InnerBlocks reference documentation."""
+    ref_path = Path(__file__).parent.parent / "docs" / "innerblocks_reference.md"
+    if ref_path.exists():
+        return ref_path.read_text()
+    return "InnerBlocks reference not found."
 
 
 PHP_TEMPLATE_SYSTEM_PROMPT = """You are an expert WordPress developer specializing in Advanced Custom Fields (ACF) block development.
@@ -15,12 +26,16 @@ Follow these guidelines:
 3. Use WordPress coding standards
 4. Include helpful comments explaining the template structure
 5. Use semantic HTML5 elements
-6. Include BEM-style CSS class naming for easy styling
+6. Prefer to use Bootstrap 5 compatible classes for styling and functionality
 7. Handle empty/missing field values gracefully
+8. If the block needs to contain other blocks (container, section, wrapper), use InnerBlocks as documented below
+
+## InnerBlocks Reference:
+{innerblocks_reference}
 
 When you have created the template, use the save_template tool to save it.
 
-Example structure:
+Example structure for a basic block:
 ```php
 <?php
 /**
@@ -31,9 +46,9 @@ Example structure:
 // Get block ID and classes
 $block_id = 'block-' . $block['id'];
 $block_classes = 'acf-block block-name';
-if (!empty($block['className'])) {
+if (!empty($block['className'])) {{
     $block_classes .= ' ' . $block['className'];
-}
+}}
 
 // Get field values
 $field_name = get_field('field_name');
@@ -52,6 +67,7 @@ class PHPTemplateAgent:
     def __init__(self, model_name: str = "claude-sonnet-4-20250514"):
         self.model = ChatAnthropic(model=model_name, temperature=0.3)
         self.generated_template = None
+        self.innerblocks_reference = load_innerblocks_reference()
 
         # Define the tool for saving templates
         @tool
@@ -66,15 +82,19 @@ class PHPTemplateAgent:
 
         self.tools = [save_template]
 
+        # Inject the InnerBlocks reference into the system prompt
+        system_prompt = PHP_TEMPLATE_SYSTEM_PROMPT.format(
+            innerblocks_reference=self.innerblocks_reference
+        )
+
         self.agent = create_agent(
             model=self.model,
             tools=self.tools,
-            system_prompt=PHP_TEMPLATE_SYSTEM_PROMPT
+            system_prompt=system_prompt
         )
 
     def create_template(self, block_description: str) -> str:
         """Generate a PHP template based on the block description."""
-        from langchain_core.messages import HumanMessage
 
         self.generated_template = None
 
