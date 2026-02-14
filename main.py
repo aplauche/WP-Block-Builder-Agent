@@ -68,6 +68,41 @@ def save_output(content: str, filename: str, output_dir: Path) -> Path:
     filepath.write_text(content)
     return filepath
 
+
+def get_current_state(orchestrator, config: dict) -> dict:
+    """Retrieve current state from orchestrator checkpoint."""
+    try:
+        snapshot = orchestrator.get_state(config)
+        return snapshot.values if snapshot else {}
+    except Exception:
+        return {}
+
+
+def is_block_complete(state: dict) -> bool:
+    """Check if block generation workflow is complete."""
+    has_php = bool(state.get("php_template"))
+    has_acf = bool(state.get("acf_json")) and "error" not in state.get("acf_json", {})
+    return has_php and has_acf
+
+
+def classify_user_intent(user_input: str) -> str:
+    """Classify user input into workflow intents."""
+    input_lower = user_input.lower().strip()
+
+    if input_lower in ("exit", "quit", "q"):
+        return "exit"
+
+    new_block_phrases = ["new block", "another block", "start over", "different block", "next block"]
+    if any(phrase in input_lower for phrase in new_block_phrases):
+        return "new_block"
+
+    done_phrases = ["done", "finished", "that's all", "looks good", "perfect"]
+    if any(phrase in input_lower for phrase in done_phrases):
+        return "finish_block"
+
+    return "continue"
+
+
 # Helper to show proposed fields - could move this into tool...
 def display_proposed_fields(fields: list) -> None:
     """Display proposed fields for user review."""
@@ -352,7 +387,7 @@ def print_welcome():
 
 
 def main():
-    """Main chat loop with HITL support."""
+    """Main conversational loop with HITL support."""
     if not os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY") == "your_api_key_here":
         print("\n❌ Error: Please set your ANTHROPIC_API_KEY in the .env file")
         print("   Get your API key from: https://console.anthropic.com/")
@@ -369,79 +404,180 @@ def main():
         sys.exit(1)
 
     thread_id = 0
+    config = None
+    in_block_session = False
+    response = None
 
     while True:
-        print("\n" + "-" * 40)
-        try:
-            user_input = input("📝 Describe your block (or 'exit'): ").strip()
-            user_block_name = input("📝 Provide a name for the block: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n\nGoodbye! 👋")
-            break
+        # ============================================
+        # PHASE A: Start new block if not in session
+        # ============================================
+        if not in_block_session:
+            print("\n" + "-" * 40)
+            try:
+                user_input = input("📝 Describe your block (or 'exit'): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nGoodbye! 👋")
+                break
 
-        if not user_input or not user_block_name:
-            print("Please enter a description and name...")
-            continue
+            if not user_input:
+                continue
 
-        if user_input.lower() in ("exit", "quit", "q"):
-            print("\nGoodbye! 👋")
-            break
+            if classify_user_intent(user_input) == "exit":
+                print("\nGoodbye! 👋")
+                break
 
-        thread_id += 1
-        config = {"configurable": {"thread_id": str(thread_id)}}
+            try:
+                user_block_name = input("📝 Provide a name for the block: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nGoodbye! 👋")
+                break
 
-        sanitized_name = sanitize_block_name(user_block_name)
+            if not user_block_name:
+                print("Please enter a block name...")
+                continue
 
-        print(f"\n🚀 Creating block: \"{user_block_name}\"")
+            # Start new session
+            thread_id += 1
+            config = {"configurable": {"thread_id": str(thread_id)}}
+            sanitized_name = sanitize_block_name(user_block_name)
 
-        kickoff_message = f"Block Title: {user_block_name} \n\n Block Name (slug): {sanitized_name} \n\n Block Description: {user_input}"
+            print(f"\n🚀 Creating block: \"{user_block_name}\"")
 
-        try:
-            response = orchestrator.invoke(
-                {"messages": [HumanMessage(content=kickoff_message)]},
-                config=config
-            )
+            kickoff_message = f"Block Title: {user_block_name} \n\n Block Name (slug): {sanitized_name} \n\n Block Description: {user_input}"
 
-            # Check for HITL interrupt (field approval)
-            while response.get('__interrupt__'):
+            try:
+                response = orchestrator.invoke(
+                    {"messages": [HumanMessage(content=kickoff_message)]},
+                    config=config
+                )
+                in_block_session = True
+            except Exception as e:
+                print_status(f"Error during generation: {e}", "error")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        # ============================================
+        # PHASE B: Conversational block session
+        # ============================================
+        while in_block_session:
+            state = get_current_state(orchestrator, config)
+
+            # B1: Handle HITL interrupt
+            if response and response.get('__interrupt__'):
                 interrupt = response['__interrupt__'][0]
                 action_request = interrupt.value.get('action_requests', [{}])[0]
                 tool_name = action_request.get('name', '')
 
                 if tool_name == 'propose_fields':
-                    # Extract proposed fields from the tool args
                     fields_json = action_request.get('args', {}).get('fields', '[]')
                     try:
                         fields = json.loads(fields_json)
                     except json.JSONDecodeError:
                         fields = []
 
-                    # Get user decision
                     decision = get_user_field_decision(fields)
 
-                    # Resume with the decision
-                    response = orchestrator.invoke(
-                        Command(resume={"decisions": [decision]}),
-                        config=config
-                    )
+                    try:
+                        response = orchestrator.invoke(
+                            Command(resume={"decisions": [decision]}),
+                            config=config
+                        )
+                    except Exception as e:
+                        print_status(f"Error resuming: {e}", "error")
+                        import traceback
+                        traceback.print_exc()
                 else:
                     # Unknown interrupt, approve by default
-                    response = orchestrator.invoke(
-                        Command(resume={"decisions": [{"type": "approve"}]}),
-                        config=config
-                    )
+                    try:
+                        response = orchestrator.invoke(
+                            Command(resume={"decisions": [{"type": "approve"}]}),
+                            config=config
+                        )
+                    except Exception as e:
+                        print_status(f"Error resuming: {e}", "error")
+                        import traceback
+                        traceback.print_exc()
+                continue  # Re-evaluate after resume
 
-            # Print final response
-            if response.get("messages"):
-                final_message = response["messages"][-1].content
-                print("\n" + "=" * 40)
-                print(final_message)
-                print("\n\nReady to create another?\n")
+            # B2: Check if block is complete
+            if is_block_complete(state):
+                if response and response.get("messages"):
+                    final_message = response["messages"][-1].content
+                    print("\n" + "=" * 40)
+                    print(final_message)
 
-        except Exception as e:
-            print_status(f"Error during generation: {e}", "error")
-            import traceback
-            traceback.print_exc()
+                print_status("Block generation finished!", "success")
+                print("\nWhat would you like to do?")
+                print("  - Describe a new block to create another")
+                print("  - Type 'exit' to quit\n")
+
+                in_block_session = False
+                response = None
+                break
+
+            # B3: Block not complete and no interrupt - LLM returned text
+            # This is the conversational continuation case
+            if response and response.get("messages"):
+                last_message = response["messages"][-1].content
+                print("\n" + "-" * 40)
+                print(f"🤖 Assistant: {last_message}")
+
+            # Get user feedback/continuation
+            print()
+            try:
+                user_feedback = input("💬 You: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n\nGoodbye! 👋")
+                return
+
+            if not user_feedback:
+                user_feedback = "Please continue with the next step."
+
+            intent = classify_user_intent(user_feedback)
+
+            if intent == "exit":
+                print("\nGoodbye! 👋")
+                return
+
+            if intent == "new_block":
+                if not is_block_complete(state) and state.get("block_name"):
+                    print(f"\n⚠️  Warning: Block '{state.get('block_name')}' is incomplete.")
+                    try:
+                        confirm = input("Start new block anyway? (y/n): ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        print("\n\nGoodbye! 👋")
+                        return
+                    if confirm != 'y':
+                        continue
+                in_block_session = False
+                response = None
+                break
+
+            if intent == "finish_block":
+                if is_block_complete(state):
+                    in_block_session = False
+                    response = None
+                    break
+                else:
+                    print("\n⚠️  The block is not yet complete. Missing:")
+                    if not state.get("php_template"):
+                        print("  - PHP template")
+                    if not state.get("acf_json") or "error" in state.get("acf_json", {}):
+                        print("  - ACF JSON configuration")
+                    user_feedback = "Please complete the remaining steps to generate the block files."
+
+            # Continue conversation with user feedback
+            try:
+                response = orchestrator.invoke(
+                    {"messages": [HumanMessage(content=user_feedback)]},
+                    config=config
+                )
+            except Exception as e:
+                print_status(f"Error: {e}", "error")
+                import traceback
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
