@@ -330,7 +330,7 @@ When a user describes a block they want, execute these steps IN ORDER without st
 4. IMMEDIATELY call generate_acf_json - do not explain or discuss
 5. IMMEDIATELY call summarize_results
 
-IMPORTANT: After each tool call completes, immediately call the next tool. Do NOT stop to explain what you did or what you're about to do. Just execute the tools in sequence until summarize_results is complete.
+IMPORTANT: After each tool call completes, immediately call the next tool. DO NOT RESPOND WITH TEXT UNTIL ALL STEPS HAVE BEEN COMPLETED.
 
 The only time to pause is when propose_fields triggers the human review. After approval, continue executing tools without commentary."""
     )
