@@ -87,6 +87,7 @@ def is_block_complete(state: dict) -> bool:
 
 def classify_user_intent(user_input: str) -> str:
     """Classify user input into workflow intents."""
+    # TODO: Run a cheap classifier model here instead of naive text detection
     input_lower = user_input.lower().strip()
 
     if input_lower in ("exit", "quit", "q"):
@@ -95,10 +96,6 @@ def classify_user_intent(user_input: str) -> str:
     new_block_phrases = ["new block", "another block", "start over", "different block", "next block"]
     if any(phrase in input_lower for phrase in new_block_phrases):
         return "new_block"
-
-    done_phrases = ["done", "finished", "that's all", "looks good", "perfect"]
-    if any(phrase in input_lower for phrase in done_phrases):
-        return "finish_block"
 
     return "continue"
 
@@ -513,6 +510,7 @@ def main():
                 print("  - Describe a new block to create another")
                 print("  - Type 'exit' to quit\n")
 
+                # Exit to new loop by turning off block session
                 in_block_session = False
                 response = None
                 break
@@ -551,22 +549,10 @@ def main():
                         return
                     if confirm != 'y':
                         continue
+                # Exit to new loop by turning off block session
                 in_block_session = False
                 response = None
                 break
-
-            if intent == "finish_block":
-                if is_block_complete(state):
-                    in_block_session = False
-                    response = None
-                    break
-                else:
-                    print("\n⚠️  The block is not yet complete. Missing:")
-                    if not state.get("php_template"):
-                        print("  - PHP template")
-                    if not state.get("acf_json") or "error" in state.get("acf_json", {}):
-                        print("  - ACF JSON configuration")
-                    user_feedback = "Please complete the remaining steps to generate the block files."
 
             # Continue conversation with user feedback
             try:
